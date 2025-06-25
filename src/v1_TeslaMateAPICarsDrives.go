@@ -63,6 +63,9 @@ func TeslaMateAPICarsDrivesV1(c *gin.Context) {
 		RangeRated      PreferredRange  `json:"range_rated"`      // PreferredRange
 		OutsideTempAvg  float64         `json:"outside_temp_avg"` // float64
 		InsideTempAvg   float64         `json:"inside_temp_avg"`  // float64
+		Efficiency      NullFloat64     `json:"efficiency"`       // NullFloat64 (percentage)
+		Consumption     NullFloat64     `json:"consumption"`      // NullFloat64 (Wh/km or Wh/mi)
+		Consumed        NullFloat64     `json:"consumed"`         // NullFloat64 (kWh)
 	}
 	// TeslaMateUnits struct - child of Data
 	type TeslaMateUnits struct {
@@ -128,6 +131,7 @@ func TeslaMateAPICarsDrivesV1(c *gin.Context) {
 			inside_temp_avg,
 			(SELECT unit_of_length FROM settings LIMIT 1) as unit_of_length,
 			(SELECT unit_of_temperature FROM settings LIMIT 1) as unit_of_temperature,
+			cars.efficiency,
 			cars.name
 		FROM drives
 		LEFT JOIN cars ON car_id = cars.id
@@ -156,6 +160,7 @@ func TeslaMateAPICarsDrivesV1(c *gin.Context) {
 
 		// creating drive object based on struct
 		drive := Drives{}
+		var CarEfficiency NullFloat64
 
 		// scanning row and putting values into the drive
 		err = rows.Scan(
@@ -189,8 +194,31 @@ func TeslaMateAPICarsDrivesV1(c *gin.Context) {
 			&drive.InsideTempAvg,
 			&UnitsLength,
 			&UnitsTemperature,
+			&CarEfficiency,
 			&CarName,
 		)
+
+		// --------------------------------------------------------------------
+		// calculate efficiency / consumption metrics when data is precise
+		// NOTE: Must be done BEFORE unit conversions while values are still in km
+
+		if drive.BatteryDetails.IsSufficientlyPrecise && drive.RangeIdeal.RangeDiff > 0 && drive.OdometerDetails.OdometerDistance > 0 && CarEfficiency.Valid {
+			// efficiency = real distance / rated range lost
+			eff := (drive.OdometerDetails.OdometerDistance / drive.RangeIdeal.RangeDiff) * 100 // as percentage
+			drive.Efficiency.Float64 = eff
+			drive.Efficiency.Valid = true
+
+			// consumed = total energy consumed in kWh
+			consumed := drive.RangeIdeal.RangeDiff * CarEfficiency.Float64
+			drive.Consumed.Float64 = consumed
+			drive.Consumed.Valid = true
+
+			// consumption = energy per unit distance (Wh/km) - will be converted to Wh/mi later if needed
+			consumption := (consumed / drive.OdometerDetails.OdometerDistance) * 1000 // convert kWh to Wh
+			drive.Consumption.Float64 = consumption
+			drive.Consumption.Valid = true
+		}
+		// --------------------------------------------------------------------
 
 		// converting values based of settings UnitsLength
 		if UnitsLength == "mi" {
@@ -205,6 +233,10 @@ func TeslaMateAPICarsDrivesV1(c *gin.Context) {
 			drive.RangeRated.StartRange = kilometersToMiles(drive.RangeRated.StartRange)
 			drive.RangeRated.EndRange = kilometersToMiles(drive.RangeRated.EndRange)
 			drive.RangeRated.RangeDiff = kilometersToMiles(drive.RangeRated.RangeDiff)
+			// Convert consumption from Wh/km to Wh/mi
+			if drive.Consumption.Valid {
+				drive.Consumption.Float64 = drive.Consumption.Float64 * 1.60934
+			}
 		}
 		// converting values based of settings UnitsTemperature
 		if UnitsTemperature == "F" {
